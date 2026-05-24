@@ -1,0 +1,29 @@
+plugins {
+    id 'base'
+}
+
+def isWindows = System.getProperty('os.name').toLowerCase().startsWith('windows')
+def npm = isWindows ? 'npm.cmd' : 'npm'
+
+tasks.register('npmInstall', Exec) {
+    inputs.file('package.json')
+    outputs.dir('node_modules')
+    commandLine npm, 'install'
+    workingDir projectDir
+}
+
+tasks.named('build') {
+    dependsOn 'npmInstall'
+    doLast {
+        exec {
+            commandLine npm, 'run', 'build'
+            workingDir projectDir
+        }
+    }
+}
+
+tasks.register('dev', Exec) {
+    dependsOn 'npmInstall'
+    commandLine npm, 'run', 'dev'
+    workingDir projectDir
+}

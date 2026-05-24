@@ -1,0 +1,3 @@
+rootProject.name = 'investment-copilot'
+include 'backend'
+include 'frontend'
