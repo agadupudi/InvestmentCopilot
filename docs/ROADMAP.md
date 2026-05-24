@@ -11,14 +11,16 @@ Five phases. Each phase ends with something you'd actually use, deployed somewhe
 **Goal:** A page showing manually-entered holdings and live P&L.
 
 Features in this phase (all implemented, see [`FEATURES.md`](FEATURES.md)):
-- Holdings CRUD (FastAPI + Postgres + SQLAlchemy 2 async)
-- Live quotes via yfinance, cached in Redis (60s TTL)
+- Holdings CRUD (Spring Boot 3 + Postgres + Spring Data JPA / Hibernate 6)
+- Live quotes via Yahoo Finance, cached in Redis (60s TTL)
 - Auto-refreshing Next.js dashboard via React Query
-- Alembic migrations
+- Flyway migrations (auto-applied on boot)
 - Health endpoint
 - Local stack via OrbStack + docker compose
+- Gradle 8.10 monorepo build (`backend` + `frontend` subprojects)
+- 41 backend unit tests (JUnit 5 + Mockito + MockMvc)
 
-**Tech learned:** FastAPI · async SQLAlchemy · uv · Next.js 16 App Router · React Query · TailwindCSS · docker compose.
+**Tech learned:** Spring Boot · Spring Data JPA · Java 21 records · Gradle multi-project · Next.js 16 App Router · React Query · TailwindCSS · docker compose.
 
 ---
 
@@ -28,8 +30,8 @@ Features in this phase (all implemented, see [`FEATURES.md`](FEATURES.md)):
 
 Capabilities to add:
 - **SnapTrade integration** — OAuth into your brokerage, auto-import holdings.
-- **WebSocket endpoint** — FastAPI `/ws/quotes` streaming price updates.
-- **Background worker** — `arq` (Redis-backed) polling for prices, publishing to Redis pub/sub.
+- **WebSocket endpoint** — Spring WebFlux or Spring `@MessageMapping` STOMP endpoint streaming price updates.
+- **Background worker** — Spring `@Scheduled` poller backed by Redis pub/sub (or a separate `worker` Gradle subproject if it grows).
 - **TimescaleDB hypertable** — store 1-minute price bars for your tickers (uses Postgres `TimescaleDB` extension).
 - **Per-ticker detail page** — `/portfolio/[symbol]` with a price chart from Recharts.
 - **Minimal auth** — Clerk or Auth.js so this can work for more than just you.
@@ -74,7 +76,7 @@ Capabilities to add:
 - **Portfolio optimization** — PyPortfolioOpt's efficient-frontier suggestions.
 - **MLflow** — track experiments, register models.
 
-**Tech learned:** pandas · scikit-learn / XGBoost · MLflow · backtesting discipline · honest model evaluation.
+**Tech learned:** Smile / DJL / Tribuo (JVM ML) — or a Python `analytics/` sidecar if we want pandas / scikit-learn / XGBoost · MLflow · backtesting discipline · honest model evaluation.
 
 **Cost:** roughly Phase 3 + maybe ~$10/mo if we use cloud notebooks.
 
@@ -86,19 +88,23 @@ Capabilities to add:
 
 **Goal:** Production-grade infra suitable for a side project that might one day support a few users.
 
-Capabilities to add:
-- **Containerize everything** — backend + frontend Dockerfiles; full local stack via `docker compose`.
-- **AWS migration** — Railway → ECS Fargate, RDS Postgres, ElastiCache Redis, S3 for ML artifacts.
-- **Terraform** — all infra as code, dev + prod environments.
-- **GitHub Actions** — CI (lint, test, build) + CD (auto-deploy on merge to main).
-- **OpenTelemetry** — traces and metrics shipped to Grafana Cloud free tier.
-- **Secrets** — AWS Secrets Manager.
+Capabilities already in place (see [`DEPLOYMENT.md`](DEPLOYMENT.md)):
+- ✅ **Backend Dockerfile** — multi-stage Gradle → JRE.
+- ✅ **AWS CDK (TypeScript)** under `infra/cdk/` — VPC, RDS Postgres, ElastiCache Redis, ECS Fargate + ALB, ECR.
+- ✅ **AWS Amplify Hosting** for the Next.js frontend (`amplify.yml` at repo root).
 
-**Tech learned:** Docker · AWS (ECS/RDS/ElastiCache) · IaC · CI/CD · observability — the full DevOps loop.
+Still to add in Phase 5:
+- **GitHub Actions** — CI (lint, test, build) + CD (build/push image, `cdk deploy` on merge to main).
+- **OpenTelemetry** — traces and metrics shipped to AWS X-Ray or Grafana Cloud free tier.
+- **Secrets rotation** — AWS Secrets Manager rotation Lambdas for the RDS password.
+- **Custom domain + HTTPS** — Route 53 + ACM cert for both ALB and Amplify app.
+- **Dev/prod environment split** — second CDK stack for production behind a separate AWS account.
 
-**Cost:** ~$30–60/mo on AWS for a small footprint.
+**Tech learned:** Docker · AWS (ECS/RDS/ElastiCache) · AWS CDK (IaC in TypeScript) · CI/CD · observability — the full DevOps loop.
 
-**Done when:** a deliberate breaking change to dev is caught by CI; a slow request can be traced end-to-end in Grafana.
+**Cost:** ~$50–60/mo on AWS for a small footprint (see DEPLOYMENT.md for the breakdown).
+
+**Done when:** a deliberate breaking change to `main` is caught by CI; a slow request can be traced end-to-end.
 
 ---
 
@@ -119,5 +125,5 @@ Not committed yet, but candidates:
 2. **Don't move on too fast.** Use the current phase for at least a week before adding the next.
 3. **Honest ML.** Walk-forward validation only. Phase 4 is for learning, not get-rich-quick.
 4. **One database for as long as possible.** Postgres + extensions instead of three different stores.
-5. **Container infra; host apps (until Phase 5).** Fast inner-loop while still developing.
+5. **Container infra; host apps (locally).** Fast inner-loop. Backend is containerized for production deploys only.
 6. **Prompt-cache everything in Phase 3.** LLM costs creep fast otherwise.

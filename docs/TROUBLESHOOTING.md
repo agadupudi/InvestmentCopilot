@@ -55,48 +55,88 @@ docker compose logs redis
 
 ---
 
-## Backend: `sqlalchemy.exc.NoSuchModuleError: Can't load plugin: sqlalchemy.dialects:postgresql.asyncpg`
+## Gradle: `ERROR: JAVA_HOME is not set`
 
-Your `DATABASE_URL` is missing the `+asyncpg` suffix.
+The Gradle wrapper needs a JDK. With the brew `openjdk@21` formula (keg-only), `java` is not on `PATH` by default. Add to `~/.zshrc`:
 
-```diff
-- postgresql://copilot:copilot@localhost:5432/copilot
-+ postgresql+asyncpg://copilot:copilot@localhost:5432/copilot
+```bash
+export JAVA_HOME="$(/usr/libexec/java_home -v 21 2>/dev/null || echo /opt/homebrew/opt/openjdk@21)"
+export PATH="$JAVA_HOME/bin:$PATH"
 ```
+
+Then `source ~/.zshrc` and verify `java --version` prints `openjdk 21…`.
+
+---
+
+## Gradle: `Unsupported class file major version` / version mismatch errors
+
+You're running an older JDK. This project requires Java 21. Verify:
+
+```bash
+java --version            # must print "openjdk 21" or later
+./gradlew --version       # "JVM:" line should match
+```
+
+If `java --version` prints 17 or earlier, install JDK 21 (`brew install openjdk@21`) and update `JAVA_HOME`.
+
+---
+
+## Gradle: very slow first build
+
+The wrapper downloads Gradle 8.10 (~120 MB) on first use, and then Spring Boot pulls hundreds of MB of dependencies into your Gradle cache (`~/.gradle/caches/`). Be patient on the first build; subsequent builds are fast.
+
+If a network blip leaves the cache corrupted:
+
+```bash
+rm -rf ~/.gradle/caches/modules-2/metadata-* 
+./gradlew :backend:build --refresh-dependencies
+```
+
+---
+
+## Backend: `Could not open ServerSocket … Address already in use`
+
+Port 8000 is occupied. Find and kill the process, or change the port:
+
+```bash
+lsof -ti:8000 | xargs kill
+# or:
+PORT=8001 ./gradlew :backend:bootRun
+```
+
+If you change the port, update `frontend/.env.local` → `NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8001` and restart `npm run dev`.
+
+---
+
+## Backend: `FlywayValidateException` or `Detected applied migration not resolved locally`
+
+This happens when the `flyway_schema_history` table contains versions whose `.sql` files no longer exist (e.g. you deleted or renamed a migration). Options:
+
+1. **Best fix:** restore the missing migration files.
+2. **Dev nuke:** wipe the DB and start over: `docker compose down -v && docker compose up -d && ./gradlew :backend:bootRun`.
+3. **Surgical fix:** delete the offending row: `docker exec -it ic-postgres psql -U copilot -d copilot -c "DELETE FROM flyway_schema_history WHERE version='2';"`.
 
 ---
 
 ## Backend: `relation "holdings" does not exist`
 
-You haven't applied migrations yet:
+Flyway didn't run, or it ran against the wrong database. Check:
 
-```bash
-cd backend
-uv run alembic upgrade head
-```
+1. `docker compose ps` — Postgres healthy?
+2. `SPRING_DATASOURCE_URL` env var (if set) — points at the local Postgres?
+3. Spring Boot logs on startup — look for `Successfully applied 1 migration to schema "public"`.
 
----
-
-## Backend: `uv: command not found`
-
-Install uv:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Then restart your shell or `source ~/.zshrc`.
+If you suspect Flyway is disabled, confirm `application.yml` has `spring.flyway.enabled: true` and that `flyway-core` is on the classpath (`./gradlew :backend:dependencies | grep flyway`).
 
 ---
 
-## Backend: `uv sync` fails on first run
+## Backend: HikariCP `Connection is not available, request timed out`
 
-If it fails downloading Python 3.12, you may be behind a proxy or have flaky network. Retry once. If it still fails:
+The Postgres pool can't reach the DB or all connections are stuck. Check:
 
-```bash
-uv python install 3.12
-uv sync
-```
+1. `docker compose ps` — Postgres still healthy?
+2. `docker compose logs postgres | tail -50` — any errors?
+3. Restart the backend (the pool is rebuilt on startup).
 
 ---
 
@@ -127,13 +167,13 @@ Watch for compile errors in that terminal. If the page is up but blank with erro
 
 ## Frontend: CORS errors in the browser console
 
-The backend's `CORS_ORIGINS` allows `http://localhost:3000` by default. If you run the frontend on a different port (or on `127.0.0.1` vs `localhost`), update the backend `.env`:
+The backend's `app.cors-origins` allows `http://localhost:3000` by default. If you run the frontend on a different port (or on `127.0.0.1` vs `localhost`), set the env var before starting the backend:
 
-```
-CORS_ORIGINS=["http://localhost:3000","http://127.0.0.1:3000"]
+```bash
+CORS_ORIGIN=http://localhost:3001 ./gradlew :backend:bootRun
 ```
 
-Restart uvicorn after editing `.env`.
+To allow multiple origins, edit `backend/src/main/resources/application.yml` and add more entries under `app.cors-origins`.
 
 ---
 
@@ -149,15 +189,15 @@ The browser couldn't reach the backend. Check:
 
 ## Quotes return `null` for valid tickers
 
-yfinance is rate limiting you. The 60-second Redis cache exists exactly for this. Wait a minute and retry. If it persists:
+Yahoo Finance is throttling, blocking the user-agent, or briefly down. The 60-second Redis cache exists exactly for this. Wait a minute and retry.
+
+If it persists, hit Yahoo directly to confirm:
 
 ```bash
-# Test yfinance directly
-cd backend
-uv run python -c "import yfinance as yf; print(yf.Ticker('AAPL').fast_info.last_price)"
+curl -A 'Mozilla/5.0' 'https://query1.finance.yahoo.com/v8/finance/chart/AAPL?interval=1d&range=1d' | jq '.chart.result[0].meta.regularMarketPrice'
 ```
 
-If that returns `None`, yfinance is unavailable — wait, or switch to Finnhub (Phase 2 plan).
+If that returns `null` or an error, Yahoo is the problem — wait, or switch to a real market-data provider (Finnhub is in the Phase 2 plan).
 
 ---
 
@@ -167,67 +207,32 @@ Volumes survive `down` by default. To wipe:
 
 ```bash
 docker compose down -v
-```
-
-Then re-run migrations:
-
-```bash
-cd backend && uv run alembic upgrade head
+./gradlew :backend:bootRun       # Flyway re-applies all migrations
 ```
 
 ---
 
-## "Port 8000 already in use" / "Port 3000 already in use"
+## Tests: `NoSuchBeanDefinitionException: RestTemplateBuilder` in `@WebMvcTest`
 
-Find and kill the process:
-
-```bash
-lsof -ti:8000 | xargs kill        # backend
-lsof -ti:3000 | xargs kill        # frontend
-```
-
-Or change the port:
-
-```bash
-# backend
-uv run uvicorn app.main:app --reload --port 8001
-
-# frontend
-PORT=3001 npm run dev
-```
-
-If you change ports, update CORS / `NEXT_PUBLIC_API_BASE_URL` accordingly.
+A `@WebMvcTest` only loads the web layer. If a controller test `@Import`s a configuration that pulls `RestTemplateBuilder` (or other infra beans), the slice can't satisfy it. Import only the configs the slice actually needs — for JSON shape verification, that's `JacksonConfig`, **not** `AppConfig`.
 
 ---
 
-## Migration generated nothing / empty `upgrade()` and `downgrade()`
+## Git: pushed commits show as work email instead of personal
 
-Alembic autogenerate compares model metadata to the DB. If models match, the migration is empty. Common causes:
-
-1. The model wasn't imported in `alembic/env.py` (we import via `from app.models import *` — make sure new models are exported in `app/models/__init__.py`).
-2. You forgot to create a new model file.
-
-Delete the empty migration file before committing.
-
----
-
-## Git: pushed commits show as `ashwingd@amazon.com` (work email) instead of personal
-
-The per-directory git identity uses `includeIf "gitdir:~/Private/"` in `~/.gitconfig`. That match is **path-prefix sensitive**.
+The per-directory git identity uses `includeIf "gitdir:..."` in `~/.gitconfig`. Verify inside the repo:
 
 ```bash
-# Inside ~/Private/InvestmentCopilot — should print personal email:
 git config user.email
 # → ashwin4920@gmail.com
 ```
 
-If it prints `ashwingd@amazon.com`:
-- You moved the repo outside `~/Private/`.
-- Your `~/.gitconfig` is missing the `includeIf` block. Add:
-  ```
-  [includeIf "gitdir:~/Private/"]
-      path = ~/.gitconfig-personal
-  ```
+If wrong, add the `includeIf` block to `~/.gitconfig`:
+
+```
+[includeIf "gitdir:~/workspace/"]
+    path = ~/.gitconfig-personal
+```
 
 ---
 
@@ -237,7 +242,7 @@ The dedicated GitHub key isn't being used. Test:
 
 ```bash
 ssh -T git@github.com
-# Should print: "Hi agadupudi! You've successfully authenticated…"
+# Should print: "Hi <user>! You've successfully authenticated…"
 ```
 
 If not:
@@ -250,7 +255,7 @@ If not:
      IdentityFile ~/.ssh/id_ed25519_github
      IdentitiesOnly yes
    ```
-2. Confirm the public key (`~/.ssh/id_ed25519_github.pub`) is registered at https://github.com/settings/keys.
+2. Confirm the public key is registered at https://github.com/settings/keys.
 3. If you have multiple keys, force the right one:
    ```bash
    GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519_github -o IdentitiesOnly=yes' git push

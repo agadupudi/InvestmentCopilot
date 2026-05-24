@@ -14,7 +14,7 @@ Open http://localhost:3000. The "Add holding" form takes:
 
 | Field | Example | Notes |
 |---|---|---|
-| Symbol | `AAPL` | Auto-uppercased; yfinance ticker |
+| Symbol | `AAPL` | Auto-uppercased; Yahoo Finance ticker |
 | Quantity | `10` or `10.5` | Fractional shares supported |
 | Avg cost | `150.50` | Per-share cost basis |
 | Notes | `Roth IRA` | Optional, free-form |
@@ -34,8 +34,8 @@ Response:
 {
   "id": 1,
   "symbol": "AAPL",
-  "quantity": "10.00000000",
-  "cost_basis": "150.50000000",
+  "quantity": "10",
+  "cost_basis": "150.50",
   "notes": "Roth IRA",
   "created_at": "2026-05-11T00:56:23.853276Z",
   "updated_at": "2026-05-11T00:56:23.853276Z"
@@ -49,6 +49,8 @@ curl -X PATCH http://127.0.0.1:8000/holdings/1 \
   -d '{"quantity":"15"}'
 ```
 
+> PATCH semantics: any field omitted (or sent as `null`) is left unchanged. To clear `notes`, send a non-null new value.
+
 Delete:
 ```bash
 curl -X DELETE http://127.0.0.1:8000/holdings/1
@@ -57,7 +59,7 @@ curl -X DELETE http://127.0.0.1:8000/holdings/1
 
 ## 2. Live quotes (cached)
 
-**What it does:** fetches the latest price for any ticker yfinance supports. Caches in Redis for 60s so repeated calls don't hit Yahoo.
+**What it does:** fetches the latest price for any ticker Yahoo Finance returns. Caches in Redis for 60s so repeated calls don't hit Yahoo.
 
 ```bash
 curl http://127.0.0.1:8000/quotes/AAPL
@@ -68,7 +70,7 @@ curl 'http://127.0.0.1:8000/quotes?symbols=AAPL,TSLA,MSFT'
 ```
 
 Behind the scenes:
-- 1st request → yfinance call → write to `quote:AAPL` in Redis with `EX 60`.
+- 1st request → `RestTemplate` GET to `https://query1.finance.yahoo.com/v8/finance/chart/<SYM>` → read `chart.result[0].meta.regularMarketPrice` → write to `quote:<SYM>` in Redis with `EX 60`.
 - 2nd–Nth requests within 60s → served from Redis.
 - After 60s → cache expires → next call refreshes.
 
@@ -80,12 +82,12 @@ The `GET /holdings` endpoint returns each row enriched with current pricing:
 {
   "id": 1,
   "symbol": "AAPL",
-  "quantity": "10.00000000",
-  "cost_basis": "150.50000000",
+  "quantity": "10",
+  "cost_basis": "150.50",
   "notes": "Roth IRA",
   "created_at": "...",
   "updated_at": "...",
-  "last_price": "293.32000732421875",
+  "last_price": "293.32",
   "market_value": "2933.20",
   "unrealized_pnl": "1428.20",
   "unrealized_pnl_pct": 94.90
@@ -95,13 +97,13 @@ The `GET /holdings` endpoint returns each row enriched with current pricing:
 Computed as:
 
 ```
-market_value     = last_price × quantity
-cost_total       = cost_basis × quantity
-unrealized_pnl   = market_value − cost_total
-unrealized_pnl_pct = (unrealized_pnl / cost_total) × 100
+market_value     = last_price × quantity                  (HALF_UP, scale 2)
+cost_total       = cost_basis × quantity                  (HALF_UP, scale 2)
+unrealized_pnl   = market_value − cost_total              (HALF_UP, scale 2)
+unrealized_pnl_pct = (unrealized_pnl / cost_total) × 100  (double)
 ```
 
-All currency math uses Python `Decimal` to avoid float drift.
+All currency math uses Java `BigDecimal` with explicit `RoundingMode.HALF_UP` to avoid float drift.
 
 ## 4. Auto-refreshing dashboard
 
@@ -119,39 +121,35 @@ curl http://127.0.0.1:8000/health
 # {"status":"ok","db":true,"redis":true}
 ```
 
-Pings Postgres (`SELECT 1`) and Redis (`PING`). Useful for:
+Implementation (`controller/HealthController.java`):
+- `JdbcTemplate.queryForObject("SELECT 1", Integer.class)` — pings Postgres
+- `StringRedisTemplate.opsForValue().get("__health__")` — pings Redis
+
+Both flags are `false` on exception, so the endpoint always returns `200 OK` with the current liveness state. Use for:
 - Smoke-testing the local stack after `docker compose up`.
-- Future Phase 5 readiness probes (k8s/ECS health checks).
+- ECS/Fargate target-group health checks in production (see `docs/DEPLOYMENT.md`).
 
-## 6. Auto-generated API docs
+Spring Boot Actuator's richer `/actuator/health` is also exposed (`management.endpoints.web.exposure.include: health, info` in `application.yml`) if you want deeper signals (disk space, individual component status, etc.).
 
-FastAPI exposes:
+## 6. Database migrations (Flyway)
 
-- **Swagger UI** — http://127.0.0.1:8000/docs — interactive, "try it out" buttons
-- **ReDoc** — http://127.0.0.1:8000/redoc — read-only, nicer for sharing
-- **OpenAPI JSON** — http://127.0.0.1:8000/openapi.json — for codegen
+Schema changes are versioned by Flyway. Every migration is a SQL file in `backend/src/main/resources/db/migration/` named `V<n>__<message>.sql`.
 
-Schemas come straight from the Pydantic models in `backend/app/schemas/`. Add a field to a model and the docs update automatically.
+Flyway runs on every backend boot — there are no manual migration commands.
 
-## 7. Database migrations
+| Task | How |
+|---|---|
+| Add a migration | drop `V2__add_foo.sql` next to V1 and restart the backend |
+| Inspect history | `docker exec -it ic-postgres psql -U copilot -d copilot -c 'SELECT * FROM flyway_schema_history;'` |
+| Clean rebuild | `docker compose down -v && docker compose up -d && ./gradlew :backend:bootRun` |
 
-Schema changes are versioned by Alembic. Every migration is a Python file in `backend/alembic/versions/` with `upgrade()` and `downgrade()` functions.
+The initial migration (`V1__initial_holdings_table.sql`) creates the `holdings` table and its symbol index.
 
-```bash
-cd backend
-uv run alembic upgrade head      # apply all pending migrations
-uv run alembic downgrade -1      # roll back one
-uv run alembic current           # show applied revision
-uv run alembic history           # full history
-```
+## 7. Type-safe end to end
 
-The initial migration (`alembic/versions/<hash>_initial_holdings_table.py`) creates the `holdings` table and its index.
-
-## 8. Type-safe end to end
-
-- Backend models → Pydantic v2 schemas → JSON.
-- Frontend has matching `Holding` / `HoldingCreate` types in `src/lib/api.ts`.
-- TypeScript catches schema drift between frontend and backend.
+- Backend JPA entity (`Holding`) → DTO records (`HoldingReadDto`, `HoldingWithQuoteDto`) → Jackson serializes to snake_case JSON with `BigDecimal` as strings.
+- Frontend has matching `Holding` / `HoldingCreate` types in `frontend/src/lib/api.ts`.
+- Field names match exactly (`cost_basis`, `last_price`, `unrealized_pnl_pct`), enforced by `spring.jackson.property-naming-strategy: SNAKE_CASE` + `JacksonConfig.bigDecimalAsStringCustomizer()`.
 
 ## What you can't do yet (Phase 2+)
 
@@ -163,7 +161,7 @@ Tracked here so you know where the rough edges are:
 - ❌ News & sentiment (Phase 3)
 - ❌ AI daily briefing (Phase 3)
 - ❌ Risk metrics, backtesting (Phase 4)
-- ❌ Production deployment, CI/CD (Phase 5)
+- ❌ CI/CD automation (Phase 5 — manual deploy via `docs/DEPLOYMENT.md` for now)
 - ❌ Multi-user / auth (Phase 2 minimal, hardened in Phase 5)
 
 See [`ROADMAP.md`](ROADMAP.md) for the full plan.

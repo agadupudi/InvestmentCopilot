@@ -1,0 +1,23 @@
+# Build outputs and caches across the monorepo
+backend/build/
+.gradle/
+**/build/
+**/.gradle/
+**/node_modules/
+**/.next/
+
+# Frontend assets the backend image doesn't need
+frontend/
+infra/
+
+# Local config
+.env
+.env.*
+!**/.env.example
+
+# Docs / git / editors
+.git/
+.idea/
+.vscode/
+.DS_Store
+*.log

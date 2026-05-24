@@ -14,16 +14,16 @@ Snapshot of how the Phase-1 system is wired and *why* it's wired that way.
          │ http://127.0.0.1:8000  → API calls (cross-origin via CORS)
          ▼
 ┌──────────────────┐         ┌──────────────────┐
-│ Next.js 16       │         │ FastAPI          │
-│ (Turbopack)      │         │ (uvicorn)        │
+│ Next.js 16       │         │ Spring Boot 3.3  │
+│ (Turbopack)      │         │ (embedded Tomcat)│
 │ App Router       │         │                  │
-│ Client component │         │  Routes          │
+│ Client component │         │  Controllers     │
 │ /src/app/page.tsx│         │  /health         │
 │                  │         │  /holdings       │
 │ React Query      │         │  /quotes         │
 └──────────────────┘         └────┬─────────┬───┘
                                   │         │
-                            asyncpg│         │redis-py
+                                JDBC│         │Lettuce
                                   ▼         ▼
                        ┌──────────────┐  ┌──────────────┐
                        │ Postgres 16  │  │ Redis 7      │
@@ -33,8 +33,8 @@ Snapshot of how the Phase-1 system is wired and *why* it's wired that way.
                                               │ cache miss
                                               │
                                   ┌───────────┴────────────┐
-                                  │ yfinance (sync,        │
-                                  │ run in worker thread)  │
+                                  │ Yahoo Finance chart v8 │
+                                  │ (RestTemplate GET)     │
                                   └────────────────────────┘
 ```
 
@@ -45,28 +45,30 @@ Browser
   │
   │ 1. fetch(/holdings)  (auto every 60s via React Query)
   ▼
-FastAPI route: api/holdings.py::list_holdings
+HoldingController.list()
   │
-  │ 2. inject AsyncSession via Depends(get_session)
+  │ 2. Spring injects HoldingService
   ▼
-services/holdings.py::list_holdings_with_quotes
+HoldingService.listWithQuotes()  (@Transactional readOnly)
   │
-  ├──▶ list_holdings(session)               ← SQLA: SELECT * FROM holdings
+  ├──▶ HoldingRepository.findAllByOrderBySymbolAsc()  ← Hibernate: SELECT * FROM holdings
   │
-  ├──▶ for each symbol → quotes.get_price(symbol)
+  ├──▶ QuoteService.getPrices(symbols)
   │     │
-  │     ├─ Redis GET quote:<SYM>            (hit → return cached)
-  │     │
-  │     └─ MISS:
-  │          ├─ asyncio.to_thread(yfinance.Ticker(...).fast_info.last_price)
-  │          ├─ Redis SET quote:<SYM> ttl=60s
-  │          └─ return price
+  │     └─ for each symbol → getPrice(symbol)
+  │          ├─ Redis GET quote:<SYM>           (hit → return cached)
+  │          │
+  │          └─ MISS:
+  │               ├─ RestTemplate.getForEntity("https://query1.finance.yahoo.com/v8/finance/chart/{symbol}", ...)
+  │               ├─ extract chart.result[0].meta.regularMarketPrice
+  │               ├─ Redis SET quote:<SYM> ttl=60s
+  │               └─ return BigDecimal
   │
   ▼
-Compute market_value, unrealized_pnl, pnl_pct (Decimal)
+Compute market_value, unrealized_pnl, pnl_pct (BigDecimal, HALF_UP)
   │
   ▼
-Return list[HoldingWithQuote] → FastAPI serializes to JSON
+Return List<HoldingWithQuoteDto> → Jackson serializes (snake_case + BigDecimal→string)
   │
   ▼
 React Query caches, page renders, sets up next refetch in 60s
@@ -74,25 +76,29 @@ React Query caches, page renders, sets up next refetch in 60s
 
 ## Why these choices
 
-**FastAPI + async stack end-to-end.** Every external I/O (DB, Redis, yfinance) is async or `to_thread`-bridged so a single uvicorn process can handle many concurrent requests. This matters when Phase 2 streams thousands of quote updates per minute.
+**Spring Boot 3.3 on Java 21.** Mature, opinionated framework with first-class auto-configuration for everything in this stack (JPA, Redis, validation, JSON). Java 21 LTS gives us records (used in DTOs), pattern matching, and virtual threads when we need them in Phase 2.
 
-**SQLAlchemy 2.x async + asyncpg.** Modern typed ORM. asyncpg is the fastest Postgres driver for Python.
+**Spring Data JPA + Hibernate 6.** Interface-only repositories (`HoldingRepository extends JpaRepository<…>`) — Spring generates the implementation. Method names like `findAllByOrderBySymbolAsc()` become SQL automatically. No boilerplate DAO classes.
 
-**Pydantic v2 everywhere.** One schema definition powers validation, OpenAPI generation, and frontend type inference (via `/openapi.json` if we add code-gen later).
+**HikariCP connection pool** (Spring Boot default). Battle-tested, low-latency, sane defaults.
 
-**Redis as both cache and future event bus.** Phase 1 uses it only for quote caching. Phase 2 will use Redis pub/sub to fan out price updates to FastAPI WebSocket clients. Same dependency, two roles.
+**Java records for DTOs.** Immutable by construction, zero boilerplate, work cleanly with Jackson and Bean Validation.
 
-**Postgres for everything.** Eventually we add the `pgvector` extension (RAG embeddings, Phase 3) and `TimescaleDB` extension (price bars, Phase 2). One database instead of three is a real productivity win.
+**Lombok on the entity.** `@Getter @Setter @NoArgsConstructor` keeps the JPA entity (`Holding`) compact. Records can't be JPA entities (immutable / no no-arg constructor), so we use Lombok there.
 
-**Next.js 16 App Router.** Server Components reduce client JS; Turbopack gives sub-second HMR. App Router is the future of Next.js — Pages Router is in maintenance.
+**Redis as both cache and future event bus.** Phase 1 uses it only for quote caching (manual `StringRedisTemplate` ops with TTL). Phase 2 will use Redis pub/sub via Spring Data Redis. Same dependency, two roles.
+
+**Postgres for everything.** Eventually we add `pgvector` (RAG, Phase 3) and TimescaleDB (price bars, Phase 2). One database instead of three.
+
+**Next.js 16 App Router.** Server Components reduce client JS; Turbopack gives sub-second HMR. App Router is the future of Next.js.
 
 **React Query on the client.** Caching, deduplication, background refetch, retries — all things you'd otherwise hand-roll with `useEffect`.
 
 **Tailwind v4.** Config-less, fast, well-suited to a dashboard with lots of small layout decisions.
 
-**Decimal arithmetic on the backend.** Currency math in floating point is a recipe for "$0.01 missing" bugs.
+**`BigDecimal` arithmetic on the backend.** Currency math in `double`/`float` is a recipe for "$0.01 missing" bugs. All money lives in `NUMERIC(20,8)` and round-trips through `BigDecimal` with explicit `RoundingMode.HALF_UP`.
 
-**App in host, infra in containers.** Postgres + Redis run in `docker compose`; FastAPI and Next.js run on the host with hot reload. We containerize the apps later (Phase 5) when we deploy to AWS — this keeps the dev loop fast now.
+**App in host, infra in containers (locally).** Postgres + Redis run in `docker compose`; Spring Boot and Next.js run on the host with hot reload (`bootRun` / `next dev`). The backend container (`backend/Dockerfile`) is only used for deployment — see `docs/DEPLOYMENT.md`.
 
 ## Data model (Phase 1)
 
@@ -111,61 +117,63 @@ CREATE INDEX ix_holdings_symbol ON holdings (symbol);
 
 `NUMERIC(20, 8)` supports fractional shares (e.g. ETF dividend reinvestments) without precision loss.
 
+Defined in `backend/src/main/resources/db/migration/V1__initial_holdings_table.sql`. Hibernate's `CamelCaseToUnderscoresNamingStrategy` maps Java field `costBasis` → column `cost_basis` automatically.
+
 There's no users/accounts table yet — single-user, local-only. Auth lands in Phase 2.
 
 ## Configuration & secrets
 
-All settings flow through `app/core/config.py` (`Settings`):
+All settings flow through Spring Boot's externalized config:
 
-1. **Defaults** are in code.
-2. **`.env`** in `backend/` overrides defaults for local dev.
-3. **OS env vars** override `.env`.
+1. **Defaults** are in `backend/src/main/resources/application.yml`.
+2. **OS env vars** override (each YAML key has a `${ENV_VAR:default}` placeholder, e.g. `SPRING_DATASOURCE_URL`, `REDIS_URL`, `CORS_ORIGIN`).
+3. **`backend/.env.example`** documents the variables you'd typically override locally or in production.
 
-We never commit `.env` (see root `.gitignore`). `.env.example` documents the shape.
+We never commit real env files (see root `.gitignore`).
 
-## Lifespan
+App-specific properties (CORS origins, cache TTL) bind into the `AppProperties` record (`config/AppProperties.java`) via `@ConfigurationProperties(prefix = "app")`.
 
-`app/main.py` uses FastAPI's `lifespan` context to dispose the SQLA engine and close the Redis connection on shutdown:
+## Lifecycle
 
-```python
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    yield
-    await engine.dispose()
-    await redis.aclose()
-```
-
-This is the canonical replacement for `@app.on_event("startup"|"shutdown")`.
+Spring Boot manages the lifecycle for us: HikariCP pool, Lettuce Redis client, and embedded Tomcat are all started and stopped through the standard `ApplicationContext`. No custom `@PreDestroy` needed for Phase 1.
 
 ## CORS
 
-The backend allows `http://localhost:3000` by default (`CORS_ORIGINS` setting). Adjust if you run the frontend on a different port or host.
+`config/WebConfig.java` implements `WebMvcConfigurer` and allows the origins listed under `app.cors-origins` (defaults to `http://localhost:3000`). Adjust via `CORS_ORIGIN` env var.
+
+## JSON serialization
+
+`config/JacksonConfig.java` registers a `Jackson2ObjectMapperBuilderCustomizer` that serializes every `BigDecimal` as a JSON **string** (via `toPlainString()`). Together with the YAML setting `spring.jackson.property-naming-strategy: SNAKE_CASE`, the wire format matches the TypeScript types declared in `frontend/src/lib/api.ts` (`cost_basis`, `last_price`, etc., all as strings).
 
 ## Caching layer
 
-`quote:<SYMBOL>` keys hold the latest fetched price as a string. TTL = `QUOTE_CACHE_TTL_SECONDS` (default 60). Two reasons:
+`quote:<SYMBOL>` keys hold the latest fetched price as a plain string. TTL = `QUOTE_CACHE_TTL_SECONDS` (default 60). Two reasons:
 
-1. **yfinance rate limits** — hitting it for every page render is quick way to get blocked.
-2. **Aggregation efficiency** — listing N holdings makes 1 yfinance call per unique symbol per minute, not per request.
+1. **Yahoo Finance rate limits** — hitting them for every page render is a quick way to get throttled.
+2. **Aggregation efficiency** — listing N holdings makes 1 Yahoo call per unique symbol per minute, not per request.
 
 When a holding's `unrealized_pnl_pct` ticks live in the dashboard, what's actually changing is React Query re-fetching `/holdings` every 60s and the backend serving from Redis or refreshing on cache expiry.
 
 ## Migrations
 
-Alembic is configured in async mode (`alembic/env.py`). Models are imported from `app.models` so autogenerate sees them. Versions live in `alembic/versions/<hash>_<message>.py`.
+Flyway is enabled in `application.yml` (`spring.flyway.enabled: true`). On every backend boot, Flyway:
 
-Workflow:
-1. Modify a model.
-2. `uv run alembic revision --autogenerate -m "msg"`.
-3. **Read the generated diff** — autogenerate misses some things (enums, server defaults, complex constraints).
-4. `uv run alembic upgrade head`.
+1. Creates `flyway_schema_history` if missing.
+2. Scans `classpath:db/migration/` for `V<n>__<name>.sql` files.
+3. Applies any not yet recorded.
+4. Hibernate then runs in `ddl-auto: validate` mode — it confirms the JPA entity matches the live schema and fails fast if not.
+
+Workflow to add a migration:
+1. Add `backend/src/main/resources/db/migration/V2__<message>.sql` (raw SQL — Postgres dialect).
+2. Update the matching JPA entity (`Holding`) if needed.
+3. Restart the backend — Flyway applies it automatically.
 
 ## What's intentionally simple right now
 
 - **No auth.** It's a single-user local app.
 - **No background workers.** All work is request-scoped.
 - **No WebSocket.** Polling every 60s is fine for Phase 1.
-- **No production hardening.** No rate limiting, no CSRF, no observability beyond stdout.
-- **No tests beyond a smoke test.** We grow tests with the surface area.
+- **No production hardening.** No rate limiting, no CSRF, no observability beyond stdout + `/health` + Actuator `/actuator/health`.
+- **Repository tests are not yet integration-tested.** Service and controller layers are covered by mocked unit tests; full DB integration via Testcontainers is a Phase-2 follow-up.
 
 These are deliberate. The plan is to add each one when its phase justifies it (see `docs/ROADMAP.md`).
